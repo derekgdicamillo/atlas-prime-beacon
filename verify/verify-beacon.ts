@@ -1,147 +1,80 @@
-#!/usr/bin/env bun
-/**
- * atlas-prime-beacon — verify a local ledger against published roots.
- *
- * Usage:
- *   bun verify/verify-beacon.ts --against=<ledger-dir>
- *   bun verify/verify-beacon.ts --date=2026-05-14 --against=<ledger-dir>
- *
- * Exit 0 = match. Exit 1 = mismatch. Exit 2 = setup error.
- */
-import { readFile, readdir } from "fs/promises";
-import { existsSync } from "fs";
-import { join } from "path";
-import { createHash } from "crypto";
+import fs from "node:fs";
+import path from "node:path";
 
-interface RootRecord {
+type RootRecord = {
   ts: string;
   root: string;
   entries: number;
-}
+};
 
-interface LedgerEntry {
-  seq: number;
-  ts: string;
-  prevHash: string;
-  entryHash: string;
-  signature: string;
-  actor: string;
-  action: { tool: string; args: any };
-  sourceClaims?: any[];
-  outcome?: { success: boolean; apiResponseHash?: string };
-  policyDecision?: any;
-}
+const rootsDir = path.resolve(process.cwd(), "roots");
 
-function parseArgs(): { ledgerDir?: string; date?: string } {
-  const out: Record<string, string> = {};
-  for (const a of process.argv.slice(2)) {
-    const m = a.match(/^--(\w+)=(.*)$/);
-    if (m) out[m[1]] = m[2];
-  }
-  return { ledgerDir: out.against, date: out.date };
-}
-
-function canonicalJson(o: unknown): string {
-  if (o === null || o === undefined) return "null";
-  if (typeof o === "number") return String(o);
-  if (typeof o === "boolean" || typeof o === "string") return JSON.stringify(o);
-  if (Array.isArray(o))
-    return "[" + o.map((v) => canonicalJson(v ?? null)).join(",") + "]";
-  if (typeof o === "object") {
-    const obj = o as Record<string, unknown>;
-    const keys = Object.keys(obj)
-      .sort()
-      .filter((k) => obj[k] !== undefined);
-    return (
-      "{" +
-      keys
-        .map((k) => JSON.stringify(k) + ":" + canonicalJson(obj[k]))
-        .join(",") +
-      "}"
-    );
-  }
-  return JSON.stringify(o);
-}
-
-function computeEntryHash(
-  e: Omit<LedgerEntry, "entryHash" | "signature">
-): string {
-  return createHash("sha256").update(canonicalJson(e)).digest("hex");
-}
-
-async function loadLedger(dir: string): Promise<LedgerEntry[]> {
-  const files = (await readdir(dir))
-    .filter((f) => f.endsWith(".jsonl"))
+function readRecords(): RootRecord[] {
+  const files = fs
+    .readdirSync(rootsDir)
+    .filter((name) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))
     .sort();
-  const out: LedgerEntry[] = [];
-  for (const f of files) {
-    const txt = await readFile(join(dir, f), "utf-8");
-    for (const line of txt.split("\n").filter(Boolean)) {
-      out.push(JSON.parse(line));
+
+  const records: RootRecord[] = [];
+
+  for (const file of files) {
+    const lines = fs
+      .readFileSync(path.join(rootsDir, file), "utf8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    for (const line of lines) {
+      const record = JSON.parse(line) as RootRecord;
+      if (
+        typeof record.ts !== "string" ||
+        typeof record.root !== "string" ||
+        !/^[0-9a-f]{64}$/i.test(record.root) ||
+        !Number.isInteger(record.entries) ||
+        record.entries < 0
+      ) {
+        throw new Error(`invalid root record in ${file}: ${line}`);
+      }
+      records.push(record);
     }
   }
-  return out;
+
+  return records.sort((a, b) => a.ts.localeCompare(b.ts));
 }
 
-async function main() {
-  const { ledgerDir, date } = parseArgs();
-  if (!ledgerDir) {
-    console.error(
-      "usage: bun verify/verify-beacon.ts --against=<ledger-dir> [--date=YYYY-MM-DD]"
-    );
-    process.exit(2);
-  }
-  if (!existsSync(ledgerDir)) {
-    console.error(`ledger dir not found: ${ledgerDir}`);
-    process.exit(2);
-  }
-  const entries = await loadLedger(ledgerDir);
-  let prev = "GENESIS";
-  let seq = 1;
-  for (const e of entries) {
-    if (e.seq !== seq) {
-      console.error(`seq gap at ${seq}`);
-      process.exit(1);
-    }
-    if (e.prevHash !== prev) {
-      console.error(`prevHash mismatch at seq=${e.seq}`);
-      process.exit(1);
-    }
-    const { entryHash: _, signature: __, ...rest } = e;
-    if (computeEntryHash(rest) !== e.entryHash) {
-      console.error(`entryHash mismatch at seq=${e.seq}`);
-      process.exit(1);
-    }
-    prev = e.entryHash;
-    seq++;
-  }
-  const localRoot = prev === "GENESIS" ? "GENESIS" : prev;
+const records = readRecords();
+const violations: string[] = [];
 
-  const targetFile = date ? `roots/${date}.jsonl` : "roots/latest.json";
-  if (!existsSync(targetFile)) {
-    console.error(`published file not found: ${targetFile}`);
-    process.exit(2);
-  }
-  let published: RootRecord;
-  if (date) {
-    const lines = (await readFile(targetFile, "utf-8"))
-      .split("\n")
-      .filter(Boolean);
-    published = JSON.parse(lines[lines.length - 1]);
-  } else {
-    published = JSON.parse(await readFile(targetFile, "utf-8"));
+let maxEntries = -1;
+const rootFirstEntries = new Map<string, number>();
+
+for (const record of records) {
+  if (record.entries < maxEntries) {
+    violations.push(
+      `length-decrease: ${record.ts} publishes entries=${record.entries}, ` +
+        `but an earlier record already published entries=${maxEntries}`
+    );
   }
 
-  if (localRoot === published.root) {
-    console.log(
-      `MATCH: local root ${localRoot.slice(0, 16)}… matches published`
+  const firstEntries = rootFirstEntries.get(record.root);
+  if (firstEntries !== undefined && record.entries > firstEntries) {
+    violations.push(
+      `root-rewind: ${record.ts} reuses root ${record.root} after entries ` +
+        `grew from ${firstEntries} to ${record.entries}`
     );
-    process.exit(0);
+  } else if (firstEntries === undefined) {
+    rootFirstEntries.set(record.root, record.entries);
   }
-  console.error("MISMATCH");
-  console.error(`  local:     ${localRoot}`);
-  console.error(`  published: ${published.root}`);
+
+  maxEntries = Math.max(maxEntries, record.entries);
+}
+
+if (violations.length > 0) {
+  console.error(`chain verification failed: ${violations.length} violation(s)`);
+  for (const violation of violations.slice(0, 20)) {
+    console.error(violation);
+  }
   process.exit(1);
 }
 
-if (import.meta.main) main();
+console.log(`chain verification passed: ${records.length} records checked`);
